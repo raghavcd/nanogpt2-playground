@@ -5,6 +5,8 @@ import torch.nn as nn
 from torch.nn import functional as F
 import inspect
 
+# TORCH_USE_CUDA_DSA
+
 
 @dataclass
 class GPTConfig:
@@ -227,14 +229,42 @@ num_return_sequences = 5
 max_length = 30
 
 import time
+import os
 
-device = "cpu"
-if torch.cuda.is_available():
-    device = "cuda"
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = "mps"
-# device ="cpu"
-print(f"using device: {device}")
+# run the training loop
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+
+# set up DDP (distributed data parallel).
+# torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
+ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+if ddp:
+    # use of DDP atm demands CUDA, we set the device appropriately according to rank
+    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+else:
+    # vanilla, non-DDP run
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    # attempt to autodetect device
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"using device: {device}")
+
+# added after video, pytorch can be serious about it's device vs. device_type distinction
+device_type = "cuda" if device.startswith("cuda") else "cpu"
 
 torch.manual_seed(1337)
 if torch.cuda.is_available():
@@ -243,10 +273,12 @@ if torch.cuda.is_available():
 total_batch_size = 524288 # 2**19, ~0.5 M tokens
 B = 32 # micro-batch size
 T = 1024 # sequence length
-assert total_batch_size % (B * T) == 0, "batch size must divide B * T"
-grad_accum_steps = total_batch_size // (B * T)
-print(f"gradient accumulation: {grad_accum_steps} updates of size {B * T}")
-print(f"total batch size: {total_batch_size} tokens")
+assert total_batch_size % (B * T * ddp_world_size) == 0, "batch size must divide B * T * ddp_world_size"
+grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+if master_process:
+    print(f"gradient accumulation: {grad_accum_steps} updates of size {B * T}")
+    print(f"total batch size: {total_batch_size} tokens")
+    
 
 train_loader = DataLoaderLite(B=8, T=1024)
 
