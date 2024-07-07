@@ -5,9 +5,6 @@ import torch.nn as nn
 from torch.nn import functional as F
 import inspect
 
-# TORCH_USE_CUDA_DSA
-
-
 @dataclass
 class GPTConfig:
     block_size: int = 1024
@@ -201,28 +198,48 @@ class GPT(nn.Module):
     
 import tiktoken
 
+import numpy as np
+
+def load_tokens(filename):
+    npt = np.load(filename)
+    ptt = torch.tensor(npt, dtype=torch.long)
+    return ptt
+
 class DataLoaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, process_rank=0, num_process=1, split='train'):
         self.B = B
         self.T = T
-        enc = tiktoken.get_encoding('gpt2')
-        with open("input.txt") as f:
-            text = f.read()
-        tokens = enc.encode(text)
-        self.token = torch.tensor(tokens)
-        print("token size: ", self.token.size())
-        print("1 epoch size: ", self.token.size(0) // (B * T))
+        self.process_rank = process_rank
+        self.num_process = num_process
+        assert split in {'train', 'val'}
 
-        self.idx = 0
+        # get the shard filenames
+        data_root = "edu_fineweb10B"
+        shards = [f for f in os.listdir(data_root) if f.endswith('.npy')]
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
+        shards = [os.path.join(data_root, s) for s in shards]
+        self.shards = shards
+        assert len(shards) > 0, "no data found :("
+        if master_process:
+            print(f"found {len(shards)} shards for {split}")
+
+        # state, init at shard 0, position 0
+        self.current_shard = 0
+        self.tokens = load_tokens(shards[self.current_shard])
+
+        self.idx = self.B * self.T * self.process_rank
     
     def next_batch(self):
         B, T = self.B, self.T
-        buf = self.token[self.idx:self.idx+B*T+1]
+        buf = self.tokens[self.idx:self.idx+B*T+1]
         x = buf[:-1].view(B, T)
         y = buf[1:].view(B, T)
-        self.idx += B*T
-        if self.idx >= len(self.token) - 2*B*T:
-            self.idx = 0
+        self.idx += B*T * self.num_process
+        if self.idx +(B*T*self.num_process + 1) >= len(self.tokens) - 2*B*T:
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.idx = self.B * self.T * self.process_rank
         return x, y
 
 num_return_sequences = 5
@@ -230,6 +247,12 @@ max_length = 30
 
 import time
 import os
+
+# -----------------------------------------------------------------------------
+# simple launch:
+# python train_gpt2.py
+# DDP launch for e.g. 8 GPUs:
+# torchrun --standalone --nproc_per_node=8 train_gpt2.py
 
 # run the training loop
 from torch.distributed import init_process_group, destroy_process_group
@@ -271,31 +294,33 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
 total_batch_size = 524288 # 2**19, ~0.5 M tokens
-B = 32 # micro-batch size
+B = 16 # micro-batch size
 T = 1024 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "batch size must divide B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
 if master_process:
     print(f"gradient accumulation: {grad_accum_steps} updates of size {B * T}")
     print(f"total batch size: {total_batch_size} tokens")
-    
 
-train_loader = DataLoaderLite(B=8, T=1024)
+
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_process=ddp_world_size, split='train')
 
 torch.set_float32_matmul_precision('high')
 
 
 #model = GPT.from_pretrained('gpt2')
 model = GPT(GPTConfig(vocab_size=50304))
-model.eval()
 model.to(device)
 model = torch.compile(model)
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank], output_device=ddp_local_rank, find_unused_parameters=False)
+raw_model = model.module if ddp else model
 # logits, loss = model(x, y)
 # print("loss: ", loss)
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 10
-max_steps = 50 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+warmup_steps = 715
+max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_steps:
@@ -313,7 +338,7 @@ def get_lr(it):
 
 # optimizer
 #optimizer = torch.optim.Adam(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
-optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device)
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
 for step in range(max_steps):
     t0 = time.time()
     optimizer.zero_grad()
@@ -321,11 +346,16 @@ for step in range(max_steps):
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
-        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
             logits, loss = model(x, y)
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
         loss.backward()
+
+    if ddp:
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
@@ -334,8 +364,13 @@ for step in range(max_steps):
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0)*1000
-    tokens_per_sec = (train_loader.B * train_loader.T) * grad_accum_steps / (t1 - t0)
-    print(f"step: {step}, loss: {loss_accum.item():.6f}, lr {lr:.4e}, norm: {norm:.4f}, time: {dt:.2f}ms, tokens/sec: {tokens_per_sec:.2f}")
+    tokens_per_sec = (train_loader.B * train_loader.T) * grad_accum_steps * ddp_world_size / (t1 - t0)
+    if master_process:
+        print(f"step: {step}, loss: {loss_accum.item():.6f}, lr {lr:.4e}, norm: {norm:.4f}, time: {dt:.2f}ms, tokens/sec: {tokens_per_sec:.2f}")
+
+if ddp:
+    destroy_process_group()
+
 import sys; sys.exit(0)
 
 import tiktoken
